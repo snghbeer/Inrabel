@@ -1,0 +1,28 @@
+#lang racket
+
+(require "interface.rkt")
+(provide make-switch-adt)
+
+(define (make-switch-adt id idx)
+  (let* ((id id)
+         (index idx)
+         (reserved #f))
+
+    (define (switch)
+      (get-switch-position id))
+
+    (define (switch!)
+      (let ((pos (switch)))
+        (if (= pos 1)
+            (set-switch-position! id 2)
+            (set-switch-position! id 1))))
+
+    (define (sw-dispatch m)
+      (cond ((eq? m 'switch!) (switch!))
+            ((eq? m 'id) id)
+            ((eq? m 'idx) index)
+            ((eq? m 'pos) (switch))))
+    sw-dispatch))
+    
+
+  

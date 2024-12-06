@@ -1,0 +1,674 @@
+#lang racket
+
+(require compatibility/mlist
+         "infrabel-components/interface.rkt"
+         "infrabel-components/train-adt.rkt"
+         "infrabel-components/switch-adt.rkt"
+         "infrabel-components/block-adt.rkt"
+         "a-d/config.rkt") ;avl tree
+
+(provide infrabel-adt)
+
+;https://docs.racket-lang.org/reference/tcp.html?fbclid=IwAR1xtSGCi_Ef16sCfBwbtVcLXnH7jk4Wk_3QDLZsM8VZ7utzvS-AkzLoDK8
+(define (server-adt) ;https://stackoverflow.com/questions/21598836/how-to-use-tcp-in-racket
+  (let ((the-listener (tcp-listen 50))
+        (otp '()))
+    
+    (define-values (in out) (tcp-accept the-listener))
+  
+    (define (loop)
+      (thread (lambda ()
+                (let ((output (read in)))
+                  (set! otp output)
+                  (sleep 1/2)
+                  (loop)))))
+    
+    (define (sendmsg msg) ;TCP
+      (write msg out)
+      (flush-output out))
+
+    (define (clean-output!)
+      (set! otp '()))
+
+    (define (close-connection)
+      (tcp-close the-listener))
+
+    (loop)
+
+    (define (server-dispatch m)
+      (cond ((eq? m 'loop) (loop))
+            ((eq? m 'otp) otp)
+            ((eq? m 'otp-clean) (clean-output!))
+            ((eq? m 'port) the-listener)
+            ((eq? m 'send) sendmsg)
+            ((eq? m 'close) (close-connection))))
+    server-dispatch))
+
+(define (infrabel-adt)
+  (let ((loco-idx 0)
+        (tree (avl))
+        (locos (make-vector 3 '()))
+        (blocks (make-vector 10 '()))
+        (switches (make-vector 10 '()))
+        (sel 0)
+        (mode '())
+        (counter-clockwise 0)
+        (server (server-adt)))
+    
+    
+    (define l '(13 14 15 17 18 19 21 22 29 30 31 32 33 34 35 36))
+    
+
+    ;;;HELP FUNCTIONS
+
+    (define (get-block-switch-by-idx idx) ;find in o(log n)
+      (let ((res (find tree idx)))
+        (when (not (eq? #f res))
+          (mcdr res))))
+
+    (define (switch? id)
+      (let* ((str (symbol->string id))
+             (character (substring str 0 1)))
+        (if (string=? "S" character)
+            #t
+            #f)))
+
+    (define (get-switch id)
+      (let* ((str (symbol->string id))
+             (sidx (substring str 3))
+             (idx (string->number sidx))
+             (bucket (vector-ref switches idx))
+             (res '()))
+        (for-each (lambda (switch)
+                    (when (equal? (switch 'id) id)
+                      (set! res switch)))
+                  bucket)
+        res))
+
+    (define (get-block id)
+      (cond ((= mode 0)
+             (let* ((str (symbol->string id))
+                    (is-switch? (switch? id)))
+               (if is-switch?
+                   (get-switch id)
+                   (let* ((sidx (substring str 2))
+                          (idx (string->number sidx))
+                          (bucket (vector-ref blocks idx))
+                          (res '()))
+                     (for-each (lambda (block)
+                                 (when (equal? (block 'id) id)
+                                   (set! res block)))
+                               bucket)
+                     res))))
+            (else (let ((res '()))
+                    (vector-map (lambda (block)
+                                  (when (equal? (block 'id) id)
+                                    (set! res block)
+                                    res)) blocks)
+                    res))
+            ))
+
+    (define (mymlist->list mlist) ;conversion of mutable list to list
+      (let ((res '())) ;+ puts list in right order
+        (mfor-each (lambda (el)
+                     (set! res (cons el res)))
+                   mlist)
+        res))
+
+    (define (vec-map proc v)
+      (let loop ((vlen (vector-length v))
+                 (idx 0))
+        (when (< idx vlen)
+          (proc (vector-ref v idx))
+          (loop vlen (+ idx 1)))))
+
+    ;;;LOCO
+
+    (define (for-each-loco proc)
+      (vec-map (lambda (loco) (when (not (null? loco))
+                                (proc loco))) locos))
+
+    (define (start-a-loco loco)
+      (loco 'start)
+      (set-loco-speed! (loco 'id) (loco 'speed)))
+
+    (define (stop-a-loco loco)
+      (set-loco-speed! (loco 'id) 0)
+      (loco 'stop-loco))
+
+    (define (invert-loco loco)
+      (let ((speed (loco 'speed)))
+        (loco 'invert!)
+        (set-loco-speed! (loco 'id) (- speed))))
+
+    (define (slow-down loco)
+      (let ((speed (loco 'speed)))
+        (if (positive? speed)
+            (when (> speed 30)
+              (loco 'slow!)
+              (set-loco-speed! (loco 'id) (loco 'speed)))
+            (when (< speed -30)
+              (loco 'slow!)
+              (set-loco-speed! (loco 'id) (loco 'speed))))))
+
+    (define (unpause-loco! loco)
+      (when (and (loco 'paused)
+                 (not (eq? (loco 'seg) (loco 'dest))))
+        (when (free-path? (loco 'path))
+          (let ((speed (loco 'speed))
+                (loco-id (loco 'id)))
+            ;(if (= speed 0)
+              ;  (begin ((set-loco-speed! loco-id counter-clockwise) ;simulator
+               ;         (start-a-loco loco)))
+                (start-a-loco loco)))));)
+
+    ;;;FUNCTIONS FOR NMBS
+
+    (define (ask-path loco)
+      (let* ((dest (loco 'dest))
+             (start (loco 'seg))
+             (start-block (get-block start))
+             (dest-block (get-block dest))
+             (start-idx (number->string(start-block 'idx)))
+             (dest-idx (number->string(dest-block 'idx)))
+             (free-idx (number->string (find-free-loco-slot))))
+        (sendmsg (vector "Path" start-idx dest-idx free-idx))))
+ 
+    (define (add-loco! loco) ;;;
+      (if (not (> loco-idx 2))
+          (let* ((id (vector-ref loco 1))
+                 (start-seg (vector-ref loco 2))
+                 (prev-seg (vector-ref loco 3))
+                 (dest (vector-ref loco 4)))
+            (let* ((loco (make-train-adt id prev-seg start-seg dest))
+                   (block (get-block (string->symbol start-seg)))
+                   (loco-id (loco 'id))              
+                   (start (loco 'seg))
+                   (prev (loco 'last-pos)))
+              (if (null? (block 'loco));is there a loco at chosen block?
+                  (begin
+                    (ask-path loco)
+                    (add-loco loco-id prev start) ;simulator
+                    ((block 'aloco) loco)
+                    (vector-set! locos loco-idx loco)
+                    (set! loco-idx (+ loco-idx 1)))
+                  (displayln "this block is taken"))))
+          (displayln "Cannot add more loco's")))                       
+
+    (define (delete-loco! otp)
+      (let* ((sel (string->number otp))
+             (loco (vector-ref locos sel)))
+        (when (not (null? loco))
+          (let* ((pos-id (loco 'seg))
+                 (loco-id (loco 'id))
+                 (block (get-block pos-id))
+                 (path (loco 'path)))
+            (unreserve-switches! path)
+            ((block 'uloco) '()) ;deletes the loco i at block j
+            (remove-loco loco-id) ;simulator
+            (vector-set! locos sel '())
+            (set! loco-idx (- loco-idx 1))
+            (sendmsg (vector "Loco-data" "unselected" "" "" ""))))))
+
+    (define (loco-speed! otp)
+      (let* ((sel (vector-ref otp 1)))
+        (if (eq? sel #f)
+            (display "Please select a loco \n")
+            (let* ((loco (vector-ref locos sel))
+                   (loco-id (loco 'id))) 
+              ((loco 'speed!) counter-clockwise)
+              (loco 'start)
+              (set-loco-speed! loco-id counter-clockwise) ;simulator
+              (send-loco-info sel)
+              (let* ((pos (loco 'seg))
+                     (dest (loco 'dest))
+                     (pos-bl (get-block pos))
+                     (dest-bl (get-block dest))
+                     (pos-idx (number->string (pos-bl 'idx)))
+                     (dest-idx (number->string (dest-bl 'idx))))
+                (sendmsg (vector "New-path!" (symbol->string loco-id) pos-idx dest-idx)))
+              ))))
+
+     
+    ;;;INFRABEL FUNCTIONS
+
+    (define (rdy-path edges)
+      (for-each (lambda (edge)
+                  (let* ((state (car edge))
+                         (from (string->number (cadr edge)))
+                         (to (string->number (caddr edge)))
+                         (to-object (get-block-switch-by-idx from)))
+                    (when (switch? (to-object 'id))
+                      (when (not (to-object 'reserved))                                 
+                        (let ((id (to-object 'id))
+                              (obj-state (to-object 'state)))
+                          (cond ((and (string=? state "2")
+                                      (= obj-state 1))
+                                 (set-switch-position! id 2) ;simulator
+                                 (reserve-switch! to-object))
+                                ((and (string=? state "1")
+                                      (= obj-state 2))
+                                 (set-switch-position! id 1) ;simulator
+                                 (reserve-switch! to-object))))
+                        ))))
+                edges))
+
+    (define (free-path? path)
+      (let ((res #t))
+        (for-each (lambda (element)
+                    (when res
+                      (let* ((from element)
+                             (to-object (get-block-switch-by-idx from)))
+                        (when (switch? (to-object 'id))
+                          (when (to-object 'reserved)                                 
+                            (set! res #f))))))
+                  path)
+        res))
+
+    (define (check-reserved-switches path)
+      (let ((res #f))
+        (for-each (lambda (element)
+                    (let* ((sw (get-block-switch-by-idx element)))
+                      (when (switch? (sw 'id))
+                        (when (sw 'reserved)
+                          (set! res #t))))) path)
+        res))
+
+    (define (reserve-switch! switch)
+      (switch 'reserve!)
+      (switch 'switch!))
+
+    (define contains member)
+    
+    (define (intersection a b) ;https://stackoverflow.com/questions/28550377/racket-intersect-two-lists/28750451
+      (if (null? a)
+          '()
+          (if (not (contains (car a) b))
+              (cons (car a) (intersection (cdr a) b))
+              (intersection (cdr a) b))))
+
+    (define (update-loco-position loco)
+      (let* ((loco-id (loco 'id))
+             (new-pos (get-loco-detection-block loco-id))
+             (loco-pos (loco 'seg))
+             (prev-pos (loco 'last-pos))
+             (pos-bl (get-block loco-pos))
+             (prev-bl (get-block prev-pos))
+             (dest-bl (get-block (loco 'dest)))
+             (pos-idx (pos-bl 'idx))
+             (dest-idx (dest-bl 'idx))
+             (prev-idx (prev-bl 'idx)))
+        (if (eq? new-pos prev-pos) ;helpt om de juiste richting te kiezen.
+            (ask-path loco)          
+            (when (and (not (eq? loco-pos new-pos))
+                       (not (eq? new-pos #f)))
+              ((loco 'pos!) new-pos)
+              (send-loco-info sel))  ; stuurt een bericht naar nmbs met de gewijzigde data
+            )))
+
+    (define (free-block? block)
+      (null? (block 'loco)))
+
+    (define (path-tracking loco) ;traject berekening + positie update
+      (let ((loco-pos (loco 'seg))
+            (paused (loco 'paused)))
+        (when (and (not (eq? loco-pos #f)) ;ignores loco if it is impossible to locate its position
+                   (not paused))
+          (let ((loco-pos-block (get-block loco-pos))
+                (loco-path (loco 'path)))
+            ;;updates position of each loco                                       
+            (update-loco-position loco)
+            ;;checks if loco is on right path
+            (let* ((block-idx (loco-pos-block 'idx)))
+              (when (eq? (member block-idx loco-path) #f) ;is the new position in the current path?
+                (let* ((pos (loco 'seg))
+                       (dest (loco 'dest))
+                       (pos-block (get-block pos))
+                       (dest-block (get-block dest))
+                       (pos-idx (pos-block 'idx))
+                       (dest-idx (dest-block 'idx)))
+                  (sendmsg (vector "New-path!"
+                                   (symbol->string (loco 'id))
+                                   (number->string pos-idx)
+                                   (number->string dest-idx))))
+                ))
+            (let ((last-block (get-block (loco 'last-pos)))
+                  (new-pos-block (get-block (loco 'seg))))
+              ((last-block 'aloco) '())
+              ((new-pos-block 'aloco) loco)) ;add a loco x at block y where loco x stands                 
+            ;;checks if loco is at destination
+            (when (equal? (loco 'dest) loco-pos)
+              (let* ((dest-block (get-block loco-pos))
+                     (dest-block-idx (dest-block 'idx))
+                     (dest (member dest-block-idx (loco 'path)))
+                     (switches (intersection (loco 'path) dest)))
+                (unreserve-switches! switches)
+                ((loco 'path!) '())
+                (stop-a-loco loco))) ;clears the loco in last visited block     
+            ))))
+
+    (define (unreserve-switches! switches)
+      (when (not (null? switches))
+        (for-each (lambda (switch-idx)
+                    (let ((switch (get-block-switch-by-idx switch-idx)))
+                      (when (switch? (switch 'id))
+                        (switch 'unreserve!))))
+                  switches)))
+    
+    ;;; Path checking & security system for each loco
+
+    (define (update-locos-and-track);;;
+      (for-each-loco (lambda (loco)
+                       (when (not (loco 'paused))
+                         (path-tracking loco))
+                       (unpause-loco! loco)
+                       )))
+
+    ;;;GRAPH INITIALIZATION
+
+    (define (load-straight-setup)
+      ;add all blocks & switch in buffer
+      (let* ((bl (get-detection-block-ids))
+             (blsiz (length bl))
+             (v (make-vector (+ blsiz 1) '()))
+             (idx 0))
+        (for-each (lambda (blck)
+                    (let* ((block (make-block-adt blck idx))
+                           (node (mcons idx block)))
+                      (vector-set! v idx block)
+                      (insert! tree node))
+                    (set! idx (+ idx 1)))
+                  bl)
+        (let* ((switch (make-switch-adt (car (get-switch-ids)) idx))
+               (nodesw (mcons idx switch)))
+          (insert! tree nodesw)
+          (vector-set! v idx switch))
+        (set! blocks v)))
+
+
+    (define (setup-loop)
+      ;add all blocks & switch in buffer
+      (let* ((bl (get-detection-block-ids))
+             (blsiz (length bl))
+             (sw (get-switch-ids))
+             (swsiz (length sw))
+             (v (make-vector (+ blsiz swsiz) '()))
+             (idx 0))
+        (for-each (lambda (blck)
+                    (let* ((bucket (vector-ref v idx))
+                           (block (make-block-adt blck idx))
+                           (node (mcons idx block)))
+                      (vector-set! v idx block)
+                      (insert! tree node))
+                    (set! idx (+ idx 1)))
+                  bl)
+        (for-each (lambda (swtch)
+                    (let* ((bucket (vector-ref v idx))
+                           (sw-adt (make-switch-adt swtch idx))
+                           (node (mcons idx sw-adt)))
+                      (vector-set! v idx sw-adt)
+                      (insert! tree node))
+                    (set! idx (+ idx 1)))
+                  sw)
+        (set! blocks v))
+      )
+
+    (define (load-harware-setup)
+      (let ((sw (get-switch-ids))
+            (bl (get-detection-block-ids))
+            (otp '()))
+        (set! switches (make-vector 10 '()))
+        (for-each (lambda (sw) ;wissels
+                    (let* ((strr (symbol->string sw))
+                           (str (if (= (string-length strr) 4)
+                                    (substring strr 2 4)
+                                    (substring strr 2 3)))
+                           (id (string->number str))
+                           (mod (modulo id 10))
+                           (bucket (vector-ref switches mod))
+                           (switch (if (= (string-length strr) 5)
+                                       (make-switch-adt (string->symbol (substring strr 0 3)) id)
+                                       (make-switch-adt sw id)))                                                
+                           (node (mcons (switch 'idx) switch)))
+                      (vector-set! switches mod (cons switch bucket))
+                      (insert! tree node)
+                      (when (= (string-length strr) 5)
+                        (let* ((idd-str (substring strr 4 5))
+                               (idd (string->number idd-str))
+                               (modd (modulo idd 10))
+                               (buck (vector-ref switches modd))
+                               (swtch (make-switch-adt (string->symbol (string-append "S-" idd-str))
+                                                       idd))
+                               (nod (mcons (swtch 'idx) swtch)))
+                          (vector-set! switches modd (cons swtch buck))
+                          (insert! tree nod)))
+                      ))
+                  sw)
+
+        (when (not (null? l)) ;detectie blokken
+          (set! blocks (make-vector 10 '()))
+          (for-each (lambda (bl)
+                      (let* ((strr (symbol->string bl))
+                             (str (substring strr 2))
+                             (id (string->number str))
+                             (mod (modulo id 10))
+                             (bucket (vector-ref blocks mod))
+                             (block (make-block-adt bl (car l)))
+                             (node (mcons (block 'idx) block)))
+                        (set! l (cdr l))
+                        (vector-set! blocks mod (cons block bucket))
+                        (insert! tree node)
+                        (set! otp (cons strr otp))))
+                    bl))
+        (sendmsg (vector "load-hardware" otp))
+        ))
+
+   
+    (define (simulator msg)
+      (cond ((string=? msg "Setup-hardware")
+             (set! mode 0)
+             (set! counter-clockwise 120)
+             (setup-hardware)
+             (load-harware-setup))
+            ((string=? msg "Setup-straight-with-switch")
+             (setup-straight-with-switch)
+             (set! mode 1)
+             (set! counter-clockwise 60)
+             (set! switches '())
+             (load-straight-setup)
+             (let ((bs (segments)))
+               (sendmsg (vector "load-straight-setup" bs))))
+            ((string=? msg "Setup-loop-and-switches")
+             (setup-loop-and-switches)
+             (set! mode 2)
+             (set! counter-clockwise 60)                    
+             (set! switches '())
+             (setup-loop)
+             (let ((bs (segments)))
+               (sendmsg (vector "load-loop-setup" bs))))
+            ))
+
+    (define (segments)
+      (let ((res '())
+            (lb '())
+            (blocks (get-detection-block-ids))
+            (switchez (get-switch-ids)))
+        (for-each (lambda (block)
+                    (set! lb (cons (symbol->string block) lb)))
+                  blocks)
+        (set! res lb)
+        res
+        ))
+
+    (define (find-loco id)
+      (let ((loco '()))
+        (for-each-loco (lambda (loc)
+                         (when (not (null? loc))
+                           (when (equal? (loc 'id) id)
+                             (set! loco loc)))))
+        loco))
+
+    (define (find-free-loco-slot)
+      (let ((res '())
+            (idx 0))
+        (vector-map (lambda (loco)
+                      (if (null? loco)
+                          (set! res idx)
+                          (set! idx (+ idx 1))))
+                    locos)
+        res))
+
+    ;;SERVER FUNCTIONS
+    (define (sendmsg msg)
+      ((server 'send) msg))
+
+    (define (close-connection)
+      (server 'close))
+
+    (define (send-loco-info loco-idx)
+      (let ((loco (vector-ref locos loco-idx)))
+        (when (not (null? loco))
+          (let ((loco-id (symbol->string (loco 'id)))
+                (pos (symbol->string(loco 'seg)))
+                (dest (symbol->string(loco 'dest)))
+                (speed (number->string (loco 'speed))))
+            (sendmsg (vector "Loco-data" loco-id pos dest speed))))))
+
+
+    (define (same-path? p1 p2)
+      (and (= (length p1) (length p2))
+           (= (car p1) (car p2))))
+
+    ;tcp loop that waits for msg from nmbs      
+
+    (define (check-otp)
+      (let ((otp (server 'otp)))
+        ;(displayln otp)
+        (when (not (null? otp))
+          (if (vector? otp)
+              (let ((msg (vector-ref otp 0)))
+                (cond ((string=? msg "Add-loco")
+                       (add-loco! otp))
+                      ((string=? msg "Delete-loco")
+                       (delete-loco! (vector-ref otp 1)))
+                      ((string=? msg "Mode")
+                       (simulator (vector-ref otp 1)))
+                      ((string=? msg "Speed!")
+                       (loco-speed! otp))
+                      ((string=? msg "Invert!")
+                       (invert-loco (vector-ref locos (vector-ref otp 1))))
+                      ((string=? msg "Loco-info")
+                       (let* ((idx (string->number (vector-ref otp 1)))
+                              (loco (vector-ref locos idx)))
+                         (when (not (null? loco))
+                           (set! sel idx))
+                         (send-loco-info idx)))
+                      ((string=? msg "Path")
+                       (let* ((path (vector-ref otp 1))
+                                      
+                              (slot (string->number (vector-ref otp 3)))
+                              (loco (vector-ref locos slot)))
+                         (when (not (null? loco))
+                           (let* ((p (map (lambda (el)
+                                            (string->number el)) path)))
+                             ((loco 'path!) p)))))
+                      ((string=? msg "New-Path!")
+                       (let* ((loco-id (string->symbol(vector-ref otp 1)))
+                              (path (vector-ref otp 2))
+                              (loco (find-loco loco-id))
+                              (p (map (lambda (el)
+                                        (string->number el)) path)))
+                         (let* ((otplen (vector-length otp))
+                                (oldp (loco 'path))
+                                (plen (length (cdr p)))
+                                (oldplen (length oldp))
+                                (edges (vector-ref otp 3))
+                                (free-path? (free-path? (loco 'path))))
+                           (when free-path?
+                             (rdy-path edges))
+                           (cond ((= otplen 5) ;if prevpos = newpos & pad korter
+                                  (if (< plen oldp)
+                                      ((loco 'path!) p) ;set het nieuwe pad
+                                                     
+                                      (invert-loco loco)))
+                                 (else
+                                  (if (and (> plen 7) ;7 is de minimum lengte van een loop-pad in een hardware-mode
+                                           (<= plen oldplen))
+                                      (when (not free-path?)
+                                        ((loco 'path!) p) ;update path
+                                        (unreserve-switches! oldp)
+                                        (rdy-path edges))
+                                      (let* ((switches (intersection oldp p))
+                                             (prev-id (loco 'last-pos))
+                                             (prev-bl (get-block prev-id))
+                                             (prev-idx (prev-bl 'idx)))
+                                        (cond ((same-path? p oldp)
+                                               (stop-a-loco loco)
+                                               (when (not free-path?)
+                                                 (unreserve-switches! oldp)
+                                                 (rdy-path edges))
+                                               (start-a-loco loco))
+                                              ((<= plen oldplen)
+                                               (stop-a-loco loco)
+                                               (slow-down loco) ;trein vertraagt telkens het pad korter wordt
+                                               ((loco 'path!) p)
+                                               (start-a-loco loco)
+                                               (when (= mode 0)
+                                                 (invert-loco loco))
+                                               (send-loco-info sel))
+                                                      
+                                              (unreserve-switches! switches)))))
+                                 ))))
+                      ))
+              (cond ((string=? otp "Stop")
+                     ;reset locos
+                     ;reset blocks
+                     ;reset switches
+                     (stop))
+                    ((string=? otp "Start")
+                     (start))
+                    ((string=? otp "Exit")
+                     (exit)
+                     )
+                    ((string=? otp "TCP-test")
+                       (sendmsg (vector "TCP-test" "succes")))
+                    ((string=? otp "close-tcp")
+                     (close-connection))
+                    ((eq? otp eof)
+                     (exit))
+                    )))))
+
+
+    (define (loop)
+      (thread
+       (lambda ()
+         (check-otp)
+         (server 'otp-clean)
+         (update-locos-and-track)
+         (sleep 1/2)
+         (loop))))
+    
+    (loop)
+    
+    (define (infrabel-dispatch m)
+      (cond ((eq? m 'add-loco!) add-loco!)
+            ((eq? m 'start) start)
+            ((eq? m 'stop) stop)
+            ((eq? m 'stop-loco) stop-a-loco)
+            ((eq? m 'delete-loco!) delete-loco!)
+            ((eq? m 'loco-speed!) loco-speed!)
+            ((eq? m 'switch?) switch?)
+            ((eq? m 'get) get-block-switch-by-idx)
+            ((eq? m 'getb) get-block)
+            ((eq? m 'check) check-reserved-switches)
+            ((eq? m 'locos) locos)
+            ((eq? m 'sw) switches)
+            ((eq? m 'free) free-path?)
+            ((eq? m 'mode) simulator)
+            ((eq? m 'send) sendmsg)
+            ((eq? m 'close-connection) (close-connection))
+            ((eq? m 's) server)
+            ))
+    infrabel-dispatch))
+
+;(define infrabel (infrabel-adt))

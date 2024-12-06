@@ -1,0 +1,3 @@
+"Setup-hardware"
+"Setup-straight-with-switch"
+"Setup-loop-and-switches"

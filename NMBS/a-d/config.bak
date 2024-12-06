@@ -1,0 +1,8 @@
+#lang racket
+
+(require "avl-tree.rkt")
+(provide avl bst? find insert! delete! empty? full? root clear)
+
+(define (clear a)
+  (when (not (empty? a))
+    (delete! (root a))))
